@@ -1,0 +1,21 @@
+{
+  "name": "claude-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "Bot de WhatsApp usando a WhatsApp Cloud API (oficial da Meta) integrado com o Claude (Anthropic) como cérebro do chatbot.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
