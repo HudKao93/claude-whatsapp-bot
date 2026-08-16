@@ -246,6 +246,11 @@ app.get('/', (_req, res) => {
   res.send('Claude WhatsApp Bot está rodando.');
 });
 
+// --- Política de Privacidade (exigida pela Meta para publicar o app) ---
+app.get('/privacidade', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'privacidade.html'));
+});
+
 // --- Endpoint manual para reativar o bot num atendimento pausado ---
 // Uso: GET /admin/unpause?phone=5516999998888&secret=SEU_ADMIN_SECRET
 app.get('/admin/unpause', (req, res) => {
