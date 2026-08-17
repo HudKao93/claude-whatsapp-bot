@@ -24,7 +24,14 @@ const {
   // Segredo simples para proteger o endpoint de reativar um atendimento pausado.
   // Se não definido, o endpoint /admin/unpause fica desabilitado.
   ADMIN_SECRET,
+  // Quantos segundos o bot espera, a partir da PRIMEIRA mensagem de um lead,
+  // antes de mandar tudo que ele escreveu nesse intervalo para o Claude de
+  // uma vez só. Evita responder mensagem por mensagem quando o lead manda
+  // várias seguidas, reduz custo de API e evita respostas fora de ordem.
+  BATCH_DELAY_SECONDS = 90,
 } = process.env;
+
+const BATCH_DELAY_MS = Number(BATCH_DELAY_SECONDS) * 1000;
 
 function loadSystemPrompt() {
   try {
@@ -76,6 +83,11 @@ const MAX_HISTORY_MESSAGES = 20; // limite para não estourar contexto/custo
 // até um humano reativar (via /admin/unpause). Some quando o processo reinicia.
 const pausedConversations = new Set();
 const PAUSE_TAG = '[[PAUSAR]]';
+
+// Lotes de mensagens pendentes por número: enquanto o timer não estoura,
+// as mensagens do lead só se acumulam aqui — nada é mandado pro Claude.
+// phone -> { messages: string[], contactName: string, timer: NodeJS.Timeout }
+const pendingBatches = new Map();
 
 function getHistory(phone) {
   if (!conversations.has(phone)) {
@@ -170,28 +182,64 @@ app.post('/webhook', async (req, res) => {
       pushToHistory(from, 'assistant', 'Entendido, vou considerar isso na condução da conversa.');
     }
 
-    const reply = await askClaude(from, userText);
+    // Não manda pro Claude na hora: acumula a mensagem num lote por número e
+    // só processa depois de BATCH_DELAY_SECONDS a partir da primeira mensagem
+    // desse lote. Se o lead mandar mais mensagens nesse meio tempo, elas só
+    // entram no mesmo lote — o timer NÃO reinicia a cada mensagem nova.
+    if (!pendingBatches.has(from)) {
+      pendingBatches.set(from, { messages: [], contactName, timer: null });
+    }
+    const batch = pendingBatches.get(from);
+    batch.messages.push(userText);
+    batch.contactName = contactName; // usa o nome mais recente, se mudar
 
-    const shouldPause = reply.includes(PAUSE_TAG);
-    const cleanReply = reply.replace(PAUSE_TAG, '').trim();
-
-    await sendWhatsAppMessage(from, cleanReply);
-    console.log(`[reply] -> ${from}: ${cleanReply}`);
-
-    if (shouldPause) {
-      pausedConversations.add(from);
-      console.log(`[pausado] Atendimento de ${from} (${contactName}) pausado para um humano assumir.`);
-      if (ADMIN_PHONE_NUMBER) {
-        const adminMsg = `⏸️ Atendimento pausado\nLead: ${contactName} (${from})\nÚltima mensagem do lead: "${userText}"\nÚltima resposta do bot: "${cleanReply}"`;
-        sendWhatsAppMessage(ADMIN_PHONE_NUMBER, adminMsg).catch((err) =>
-          console.warn('[admin-notify] falhou:', err.response?.data || err.message)
+    if (!batch.timer) {
+      console.log(
+        `[lote] Iniciando janela de ${BATCH_DELAY_SECONDS}s para ${from} (${contactName}).`
+      );
+      batch.timer = setTimeout(() => {
+        processBatch(from).catch((err) =>
+          console.error('[lote] Erro ao processar lote:', err.response?.data || err.message)
         );
-      }
+      }, BATCH_DELAY_MS);
+    } else {
+      console.log(`[lote] Mensagem extra de ${from} adicionada ao lote em andamento.`);
     }
   } catch (err) {
     console.error('[webhook] Erro ao processar mensagem:', err.response?.data || err.message);
   }
 });
+
+// --- Processa o lote acumulado de um número: junta as mensagens, manda pro
+// Claude de uma vez só, responde e trata pausa/aviso ao admin ---
+async function processBatch(phone) {
+  const batch = pendingBatches.get(phone);
+  if (!batch) return;
+  pendingBatches.delete(phone);
+
+  const { messages, contactName } = batch;
+  const combinedText = messages.join('\n');
+  console.log(`[lote] Processando ${messages.length} mensagem(ns) de ${phone} (${contactName}).`);
+
+  const reply = await askClaude(phone, combinedText);
+
+  const shouldPause = reply.includes(PAUSE_TAG);
+  const cleanReply = reply.replace(PAUSE_TAG, '').trim();
+
+  await sendWhatsAppMessage(phone, cleanReply);
+  console.log(`[reply] -> ${phone}: ${cleanReply}`);
+
+  if (shouldPause) {
+    pausedConversations.add(phone);
+    console.log(`[pausado] Atendimento de ${phone} (${contactName}) pausado para um humano assumir.`);
+    if (ADMIN_PHONE_NUMBER) {
+      const adminMsg = `⏸️ Atendimento pausado\nLead: ${contactName} (${phone})\nÚltima(s) mensagem(ns) do lead:\n"${combinedText}"\nÚltima resposta do bot: "${cleanReply}"`;
+      sendWhatsAppMessage(ADMIN_PHONE_NUMBER, adminMsg).catch((err) =>
+        console.warn('[admin-notify] falhou:', err.response?.data || err.message)
+      );
+    }
+  }
+}
 
 // --- Chama o Claude com o histórico da conversa ---
 async function askClaude(phone, userText) {
