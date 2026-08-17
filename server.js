@@ -219,12 +219,44 @@ async function processBatch(phone) {
 
   const { messages, contactName } = batch;
   const combinedText = messages.join('\n');
+
+  if (pausedConversations.has(phone)) {
+    // O atendimento pode ter sido pausado enquanto esse lote esperava a
+    // janela de tempo (ex: um lote anterior do mesmo lead já pausou nesse
+    // meio tempo). Só guarda no histórico para contexto, não chama o Claude
+    // de novo — é isso que evitava o bot "vazar" respostas confusas depois
+    // de já ter pausado.
+    pushToHistory(phone, 'user', combinedText);
+    console.log(`[pausado] Lote de ${phone} (${contactName}) descartado: atendimento já está pausado.`);
+    return;
+  }
+
   console.log(`[lote] Processando ${messages.length} mensagem(ns) de ${phone} (${contactName}).`);
 
-  const reply = await askClaude(phone, combinedText);
+  let reply;
+  try {
+    reply = await askClaude(phone, combinedText);
+  } catch (err) {
+    console.error(`[claude] Erro ao gerar resposta para ${phone}:`, err.response?.data || err.message);
+    await notifyPauseAndHandOff(phone, contactName, combinedText, '(erro ao gerar resposta automática)');
+    return;
+  }
 
   const shouldPause = reply.includes(PAUSE_TAG);
   const cleanReply = reply.replace(PAUSE_TAG, '').trim();
+
+  if (!cleanReply) {
+    await notifyPauseAndHandOff(phone, contactName, combinedText, '(resposta vazia do modelo)');
+    return;
+  }
+
+  if (!shouldPause && looksSuspicious(cleanReply)) {
+    // Não é um [[PAUSAR]] normal, mas o texto parece ter vazado raciocínio
+    // interno em vez de ser uma resposta de atendimento de verdade. Mais
+    // seguro pausar do que mandar isso pro lead.
+    await notifyPauseAndHandOff(phone, contactName, combinedText, '(resposta com conteúdo fora do padrão)');
+    return;
+  }
 
   await sendWhatsAppMessage(phone, cleanReply);
   console.log(`[reply] -> ${phone}: ${cleanReply}`);
@@ -232,12 +264,7 @@ async function processBatch(phone) {
   if (shouldPause) {
     pausedConversations.add(phone);
     console.log(`[pausado] Atendimento de ${phone} (${contactName}) pausado para um humano assumir.`);
-    if (ADMIN_PHONE_NUMBER) {
-      const adminMsg = `⏸️ Atendimento pausado\nLead: ${contactName} (${phone})\nÚltima(s) mensagem(ns) do lead:\n"${combinedText}"\nÚltima resposta do bot: "${cleanReply}"`;
-      sendWhatsAppMessage(ADMIN_PHONE_NUMBER, adminMsg).catch((err) =>
-        console.warn('[admin-notify] falhou:', err.response?.data || err.message)
-      );
-    }
+    notifyAdmin(phone, contactName, combinedText, `Última resposta do bot: "${cleanReply}"`);
   }
 }
 
@@ -255,8 +282,54 @@ async function askClaude(phone, userText) {
   const textBlock = response.content.find((block) => block.type === 'text');
   const replyText = textBlock?.text?.trim() || 'Desculpe, não consegui gerar uma resposta agora.';
 
-  pushToHistory(phone, 'assistant', replyText);
+  // Guarda no histórico já SEM a tag de pausa: ela é um sinal interno pro
+  // sistema, não faz sentido o modelo "ver" no histórico que ele mesmo já
+  // pausou antes — isso é o que causava respostas confusas tipo "eu já
+  // pausei, não devo responder mais" quando um lote seguinte do mesmo lead
+  // ainda chegava para ser processado.
+  pushToHistory(phone, 'assistant', replyText.replace(PAUSE_TAG, '').trim());
   return replyText;
+}
+
+// --- Padrões que indicam que a resposta do modelo "vazou" raciocínio interno
+// ou saiu do personagem, em vez de ser uma resposta normal pro lead. Nesses
+// casos é mais seguro pausar e chamar um humano do que mandar isso pro lead. ---
+const SUSPICIOUS_REPLY_PATTERNS = [
+  /as an ai/i,
+  /i should not/i,
+  /i notice/i,
+  /i cannot continue/i,
+  /system prompt/i,
+  /\[\[PAUSAR\]\]/,
+];
+
+function looksSuspicious(text) {
+  return SUSPICIOUS_REPLY_PATTERNS.some((re) => re.test(text));
+}
+
+// --- Pausa o atendimento e avisa o admin, sem mandar nada estranho pro lead.
+// Usado quando o Claude falha, devolve algo vazio, ou devolve algo que parece
+// ter vazado raciocínio interno em vez de uma resposta normal. ---
+async function notifyPauseAndHandOff(phone, contactName, combinedText, motivo) {
+  pausedConversations.add(phone);
+  console.log(`[pausado] Atendimento de ${phone} (${contactName}) pausado. Motivo: ${motivo}`);
+  try {
+    await sendWhatsAppMessage(
+      phone,
+      'Só um instante 😊 vou confirmar uma informação com a nossa equipe e já te retorno por aqui.'
+    );
+  } catch (err) {
+    console.warn('[processBatch] Falha ao avisar o lead sobre a pausa:', err.response?.data || err.message);
+  }
+  notifyAdmin(phone, contactName, combinedText, motivo);
+}
+
+function notifyAdmin(phone, contactName, combinedText, note) {
+  if (!ADMIN_PHONE_NUMBER) return;
+  const adminMsg = `⏸️ Atendimento pausado\nLead: ${contactName} (${phone})\nÚltima(s) mensagem(ns) do lead:\n"${combinedText}"\n${note}`;
+  sendWhatsAppMessage(ADMIN_PHONE_NUMBER, adminMsg).catch((err) =>
+    console.warn('[admin-notify] falhou:', err.response?.data || err.message)
+  );
 }
 
 // --- Envia mensagem de texto via WhatsApp Cloud API ---
